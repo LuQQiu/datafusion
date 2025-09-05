@@ -32,6 +32,7 @@ use crate::limit_pushdown::LimitPushdown;
 use crate::limited_distinct_aggregation::LimitedDistinctAggregation;
 use crate::output_requirements::OutputRequirements;
 use crate::projection_pushdown::ProjectionPushdown;
+use crate::push_limit_into_anti_join::PushLimitIntoAntiJoin;
 use crate::sanity_checker::SanityCheckPlan;
 use crate::topk_aggregation::TopKAggregation;
 use crate::update_aggr_exprs::OptimizeAggregateOrder;
@@ -152,6 +153,10 @@ impl PhysicalOptimizer {
             // Therefore it should be run at the end of the optimization process since any changes to the plan may break the dynamic filter's references.
             // See `FilterPushdownPhase` for more details.
             Arc::new(FilterPushdown::new_post_optimization()),
+            // Push limits into anti-joins for early termination and I/O reduction.
+            // Runs last to work with the final plan structure.
+            // Pushes fetch directly to DataSourceExec when possible.
+            Arc::new(PushLimitIntoAntiJoin::new()),
             // The SanityCheckPlan rule checks whether the order and
             // distribution requirements of each node in the plan
             // is satisfied. It will also reject non-runnable query
