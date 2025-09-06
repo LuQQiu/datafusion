@@ -137,9 +137,6 @@ impl PhysicalOptimizer {
             // This can possibly be combined with [LimitPushdown]
             // It needs to come after [EnforceSorting]
             Arc::new(LimitPushPastWindows::new()),
-            // The LimitPushDownAntiJoin rule pushes limits into anti-joins for early termination
-            // This needs to run BEFORE LimitPushdown
-            Arc::new(LimitPushDownAntiJoin::new()),
             // The LimitPushdown rule tries to push limits down as far as possible,
             // replacing operators with fetching variants, or adding limits
             // past operators that support limit pushdown.
@@ -165,6 +162,9 @@ impl PhysicalOptimizer {
             // given query plan; i.e. it only acts as a final
             // gatekeeping rule.
             Arc::new(SanityCheckPlan::new()),
+            // The LimitPushDownAntiJoin rule pushes limits into anti-joins for early termination
+            // This runs last to work with the final optimized plan
+            Arc::new(LimitPushDownAntiJoin::new()),
         ];
 
         Self::with_rules(rules)

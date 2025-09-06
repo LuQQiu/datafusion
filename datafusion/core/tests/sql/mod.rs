@@ -65,6 +65,7 @@ mod path_partition;
 mod runtime_config;
 pub mod select;
 mod sql_api;
+mod test_anti_join_limit_pushdown;
 
 async fn register_aggregate_csv_by_sql(ctx: &SessionContext) {
     let testdata = test_util::arrow_test_data();
