@@ -27,6 +27,7 @@ use crate::enforce_distribution::EnforceDistribution;
 use crate::enforce_sorting::EnforceSorting;
 use crate::filter_pushdown::FilterPushdown;
 use crate::join_selection::JoinSelection;
+use crate::limit_push_down_anti_join::LimitPushDownAntiJoin;
 use crate::limit_pushdown::LimitPushdown;
 use crate::limited_distinct_aggregation::LimitedDistinctAggregation;
 use crate::output_requirements::OutputRequirements;
@@ -146,6 +147,9 @@ impl PhysicalOptimizer {
             // given query plan; i.e. it only acts as a final
             // gatekeeping rule.
             Arc::new(SanityCheckPlan::new()),
+            // The LimitPushDownAntiJoin rule pushes limits into anti-joins for early termination
+            // This runs last to work with the final optimized plan
+            Arc::new(LimitPushDownAntiJoin::new()),
         ];
 
         Self::with_rules(rules)
