@@ -116,7 +116,7 @@ impl BuildSide {
 ///  └─ ProcessProbeBatch
 ///
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) enum HashJoinStreamState {
     /// Initial state for HashJoinStream indicating that build-side data not collected yet
     WaitBuildSide,
@@ -142,7 +142,7 @@ impl HashJoinStreamState {
 }
 
 /// Container for HashJoinStreamState::ProcessProbeBatch related data
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct ProcessProbeBatchState {
     /// Current probe-side batch
     batch: RecordBatch,
@@ -205,6 +205,10 @@ pub(super) struct HashJoinStream {
     right_side_ordered: bool,
     /// Shared bounds accumulator for coordinating dynamic filter updates (optional)
     bounds_accumulator: Option<Arc<SharedBoundsAccumulator>>,
+    /// Limit for anti-join early termination (per partition)
+    limit: Option<usize>,
+    /// Count of rows produced so far (for anti-join early termination)
+    produced_rows: usize,
 }
 
 impl RecordBatchStream for HashJoinStream {
@@ -307,6 +311,7 @@ impl HashJoinStream {
         hashes_buffer: Vec<u64>,
         right_side_ordered: bool,
         bounds_accumulator: Option<Arc<SharedBoundsAccumulator>>,
+        limit: Option<usize>,
     ) -> Self {
         Self {
             partition,
@@ -325,6 +330,8 @@ impl HashJoinStream {
             hashes_buffer,
             right_side_ordered,
             bounds_accumulator,
+            limit,
+            produced_rows: 0,
         }
     }
 
@@ -394,6 +401,16 @@ impl HashJoinStream {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
+        // Check if we've already hit the limit for anti-joins
+        if let Some(limit) = self.limit {
+            if matches!(self.join_type, JoinType::LeftAnti | JoinType::RightAnti) {
+                if self.produced_rows >= limit {
+                    self.state = HashJoinStreamState::Completed;
+                    return Poll::Ready(Ok(StatefulStreamResult::Ready(None)));
+                }
+            }
+        }
+        
         match ready!(self.right.poll_next_unpin(cx)) {
             None => {
                 self.state = HashJoinStreamState::ExhaustedProbeSide;
@@ -433,6 +450,17 @@ impl HashJoinStream {
     fn process_probe_batch(
         &mut self,
     ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+        // Check if we've already produced enough rows for anti-join
+        if let Some(limit) = self.limit {
+            if matches!(self.join_type, JoinType::LeftAnti | JoinType::RightAnti) {
+                if self.produced_rows >= limit {
+                    // We've produced enough rows, stop processing
+                    self.state = HashJoinStreamState::Completed;
+                    return Ok(StatefulStreamResult::Ready(None));
+                }
+            }
+        }
+        
         let state = self.state.try_as_process_probe_batch_mut()?;
         let build_side = self.build_side.try_as_ready_mut()?;
 
@@ -449,6 +477,11 @@ impl HashJoinStream {
             )?;
             self.join_metrics.output_batches.add(1);
             timer.done();
+            
+            // Update produced rows count for anti-joins
+            if matches!(self.join_type, JoinType::LeftAnti | JoinType::RightAnti) {
+                self.produced_rows += result.num_rows();
+            }
 
             self.state = HashJoinStreamState::FetchProbeBatch;
 
@@ -520,13 +553,26 @@ impl HashJoinStream {
             last_joined_right_idx.map_or(0, |v| v + 1)
         };
 
-        let (left_indices, right_indices) = adjust_indices_by_join_type(
+        let (mut left_indices, mut right_indices) = adjust_indices_by_join_type(
             left_indices,
             right_indices,
             index_alignment_range_start..index_alignment_range_end,
             self.join_type,
             self.right_side_ordered,
         )?;
+        
+        // For anti-joins with limit, check if we should stop after this batch
+        let mut should_complete = false;
+        if let Some(limit) = self.limit {
+            if matches!(self.join_type, JoinType::LeftAnti | JoinType::RightAnti) {
+                self.produced_rows += right_indices.len();
+                // Stop processing after this batch if we've hit the limit
+                // It's OK to overshoot - no need to trim
+                if self.produced_rows >= limit {
+                    should_complete = true;
+                }
+            }
+        }
 
         let result = if self.join_type == JoinType::RightMark {
             build_batch_from_indices(
@@ -553,7 +599,10 @@ impl HashJoinStream {
         self.join_metrics.output_batches.add(1);
         timer.done();
 
-        if next_offset.is_none() {
+        // Update state for next iteration (unless we're done due to limit)
+        if should_complete {
+            self.state = HashJoinStreamState::Completed;
+        } else if next_offset.is_none() {
             self.state = HashJoinStreamState::FetchProbeBatch;
         } else {
             state.advance(
@@ -561,7 +610,7 @@ impl HashJoinStream {
                     .ok_or_else(|| internal_datafusion_err!("unexpected None offset"))?,
                 last_joined_right_idx,
             )
-        };
+        }
 
         Ok(StatefulStreamResult::Ready(Some(result)))
     }

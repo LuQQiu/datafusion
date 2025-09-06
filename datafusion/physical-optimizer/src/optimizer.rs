@@ -29,6 +29,7 @@ use crate::ensure_coop::EnsureCooperative;
 use crate::filter_pushdown::FilterPushdown;
 use crate::join_selection::JoinSelection;
 use crate::limit_pushdown::LimitPushdown;
+use crate::limit_push_down_anti_join::LimitPushDownAntiJoin;
 use crate::limited_distinct_aggregation::LimitedDistinctAggregation;
 use crate::output_requirements::OutputRequirements;
 use crate::projection_pushdown::ProjectionPushdown;
@@ -136,6 +137,9 @@ impl PhysicalOptimizer {
             // This can possibly be combined with [LimitPushdown]
             // It needs to come after [EnforceSorting]
             Arc::new(LimitPushPastWindows::new()),
+            // The LimitPushDownAntiJoin rule pushes limits into anti-joins for early termination
+            // This needs to run BEFORE LimitPushdown
+            Arc::new(LimitPushDownAntiJoin::new()),
             // The LimitPushdown rule tries to push limits down as far as possible,
             // replacing operators with fetching variants, or adding limits
             // past operators that support limit pushdown.

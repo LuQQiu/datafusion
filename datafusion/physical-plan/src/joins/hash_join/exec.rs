@@ -357,6 +357,9 @@ pub struct HashJoinExec {
     /// Set when dynamic filter pushdown is detected in handle_child_pushdown_result.
     /// HashJoinExec also needs to keep a shared bounds accumulator for coordinating updates.
     dynamic_filter: Option<HashJoinExecDynamicFilter>,
+    /// Limit for anti-join early termination (per partition)
+    /// When set, each partition will stop processing after producing this many rows
+    pub limit: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -385,6 +388,7 @@ impl fmt::Debug for HashJoinExec {
             .field("column_indices", &self.column_indices)
             .field("null_equality", &self.null_equality)
             .field("cache", &self.cache)
+            .field("limit", &self.limit)
             // Explicitly exclude dynamic_filter to avoid runtime state differences in tests
             .finish()
     }
@@ -459,6 +463,7 @@ impl HashJoinExec {
             null_equality,
             cache,
             dynamic_filter: None,
+            limit: None,
         })
     }
 
@@ -493,6 +498,33 @@ impl HashJoinExec {
     /// How the join is performed
     pub fn join_type(&self) -> &JoinType {
         &self.join_type
+    }
+
+    /// Get the limit for anti-join early termination
+    pub fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+    
+    /// Create a new HashJoinExec with the specified limit
+    pub fn with_limit(&self, limit: usize) -> Self {
+        HashJoinExec {
+            left: Arc::clone(&self.left),
+            right: Arc::clone(&self.right),
+            on: self.on.clone(),
+            filter: self.filter.clone(),
+            join_type: self.join_type,
+            join_schema: Arc::clone(&self.join_schema),
+            left_fut: Arc::new(OnceAsync::default()),
+            random_state: self.random_state.clone(),
+            mode: self.mode,
+            metrics: ExecutionPlanMetricsSet::new(),
+            projection: self.projection.clone(),
+            column_indices: self.column_indices.clone(),
+            null_equality: self.null_equality,
+            cache: self.cache.clone(),
+            dynamic_filter: self.dynamic_filter.clone(),
+            limit: Some(limit),
+        }
     }
 
     /// The schema after join. Please be careful when using this schema,
@@ -857,6 +889,7 @@ impl ExecutionPlan for HashJoinExec {
             )?,
             // Keep the dynamic filter, bounds accumulator will be reset
             dynamic_filter: self.dynamic_filter.clone(),
+            limit: self.limit,
         }))
     }
 
@@ -879,6 +912,7 @@ impl ExecutionPlan for HashJoinExec {
             cache: self.cache.clone(),
             // Reset dynamic filter and bounds accumulator to initial state
             dynamic_filter: None,
+            limit: self.limit,
         }))
     }
 
@@ -1019,6 +1053,7 @@ impl ExecutionPlan for HashJoinExec {
             vec![],
             self.right.output_ordering().is_some(),
             bounds_accumulator,
+            self.limit,
         )))
     }
 
@@ -1180,6 +1215,7 @@ impl ExecutionPlan for HashJoinExec {
                         filter: dynamic_filter,
                         bounds_accumulator: OnceLock::new(),
                     }),
+                    limit: self.limit,
                 });
                 result = result.with_updated_node(new_node as Arc<dyn ExecutionPlan>);
             }
