@@ -878,3 +878,56 @@ DROP TABLE asof_corr_l;
 
 statement ok
 DROP TABLE asof_corr_r;
+
+# With one target partition the right input is streamed into the join instead of
+# being collected and broadcast. Results must not change.
+statement ok
+SET datafusion.execution.target_partitions = 1;
+
+query IPPT
+SELECT l.id, l.ts, r.ts, r.val
+FROM asof_left l
+ASOF JOIN asof_right r
+MATCH_CONDITION (l.ts >= r.ts)
+ON l.grp = r.grp
+ORDER BY l.id;
+----
+1 2024-01-01T09:00:01 NULL NULL
+2 2024-01-01T09:00:04 2024-01-01T09:00:04 a4
+3 2024-01-01T09:00:07 2024-01-01T09:00:06 a6
+4 2024-01-01T09:00:02 2024-01-01T09:00:01 b1
+5 2024-01-01T09:00:08 2024-01-01T09:00:06 b6
+6 2024-01-01T09:00:03 NULL NULL
+7 NULL NULL NULL
+
+query IPPT
+SELECT l.id, l.ts, r.ts, r.val
+FROM asof_left l
+ASOF JOIN asof_right r
+MATCH_CONDITION (l.ts <= r.ts)
+ON l.grp = r.grp
+ORDER BY l.id;
+----
+1 2024-01-01T09:00:01 2024-01-01T09:00:02 a2
+2 2024-01-01T09:00:04 2024-01-01T09:00:04 a4
+3 2024-01-01T09:00:07 NULL NULL
+4 2024-01-01T09:00:02 2024-01-01T09:00:06 b6
+5 2024-01-01T09:00:08 NULL NULL
+6 2024-01-01T09:00:03 NULL NULL
+7 NULL NULL NULL
+
+query IT
+SELECT l.id, r.label
+FROM (VALUES (1, 1), (2, 5), (3, CAST(NULL AS INT))) AS l(id, ts)
+ASOF JOIN (VALUES (2, 'r2'), (4, 'r4')) AS r(ts, label)
+MATCH_CONDITION (l.ts >= r.ts)
+ORDER BY l.id;
+----
+1 NULL
+2 r4
+3 NULL
+
+# The harness checks the file leaves no configuration changed, and RESET would
+# restore the system default rather than the harness setting.
+statement ok
+SET datafusion.execution.target_partitions = 4;

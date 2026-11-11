@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
-//! Broadcast, left-preserving ASOF join execution.
+//! Ordered, left-preserving ASOF join execution.
 //!
 //! An ASOF join emits exactly one output row for every left row. Within an
 //! optional equality-key group, it selects the closest right row that satisfies
@@ -13,9 +13,11 @@
 //! left.ts <= right.ts  => smallest eligible right.ts
 //! ```
 //!
-//! The right input is collected and shared by all output partitions. The left
-//! input remains partitioned, and each partition performs an independent
-//! monotonic scan over the ordered right input.
+//! When the left input has a single partition, the right input is streamed
+//! directly into the join and only the batches the scan still references are
+//! retained. With two or more left partitions, the right input is collected
+//! once and shared, because each partition performs an independent monotonic
+//! scan over it. The left input remains partitioned in both modes.
 //!
 //! [`AsOfJoinExec::input_distribution_requirements`] requires a single right
 //! partition but leaves the left distribution unrestricted.
@@ -40,15 +42,15 @@
 //! ```
 //!
 //! Each left partition owns its cursors, equality-group state, and current
-//! candidate, while the collected right batches are immutable and shared.
-//! The key state-machine entry point is [`AsOfJoinStream::poll_next_impl`].
+//! candidate. The key state-machine entry point is
+//! [`AsOfJoinStream::poll_next_impl`].
 //!
 //! This mode preserves probe-side parallelism when there are no equality keys
-//! or when equality keys have low cardinality or skew. It retains the complete
-//! right input in the memory pool and may scan it once per left partition.
-//! Alternative strategies, including broadcasting the other side or
-//! repartitioning both inputs, remain future work for other input-size and
-//! key-distribution profiles.
+//! or when equality keys have low cardinality or skew. With two or more left
+//! partitions it retains the complete right input in the memory pool and may
+//! scan it once per left partition. Alternative strategies, including
+//! broadcasting the other side or repartitioning both inputs, remain future
+//! work for other input-size and key-distribution profiles.
 //!
 //! [ASOF JOIN]: https://docs.snowflake.com/en/sql-reference/constructs/asof-join
 
@@ -69,7 +71,9 @@ use arrow::datatypes::{Schema, SchemaRef};
 use datafusion_common::float_semantics::normalize_floats;
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::TreeNodeRecursion;
-use datafusion_common::utils::memory::RecordBatchMemoryCounter;
+use datafusion_common::utils::memory::{
+    RecordBatchMemoryCounter, RecordBatchMemoryTracker,
+};
 use datafusion_common::{
     ColumnStatistics, JoinSide, JoinType, NullEquality, Result, Statistics,
     assert_eq_or_internal_err, internal_err, plan_err, project_schema,
@@ -125,7 +129,12 @@ impl AsOfMatchExpr {
     }
 }
 
-/// A broadcast sort-merge ASOF join that emits one row for every left row.
+/// A sort-merge ASOF join that emits one row for every left row.
+///
+/// With a single left partition the right input is streamed into the join, and
+/// only the right batches the scan still references are retained. With two or
+/// more left partitions the right input is collected once and broadcast, since
+/// every partition scans it independently.
 #[derive(Debug)]
 pub struct AsOfJoinExec {
     left: Arc<dyn ExecutionPlan>,
@@ -144,6 +153,7 @@ pub struct AsOfJoinExec {
     /// Required global ordering for the single right partition.
     right_ordering: LexOrdering,
     /// Shared collection future that materializes the right input only once.
+    /// Unused when the left input has a single partition.
     right_fut: OnceAsync<BroadcastRightInput>,
     cache: Arc<PlanProperties>,
 }
@@ -479,17 +489,7 @@ impl ExecutionPlan for AsOfJoinExec {
         );
         let left_stream = self.left.execute(partition, Arc::clone(&context))?;
         let metrics = AsOfJoinMetrics::new(partition, &self.metrics);
-        let build_metrics = metrics.clone();
-        let right_fut = self.right_fut.try_once(|| {
-            let right_stream = self.right.execute(0, Arc::clone(&context))?;
-            let reservation =
-                MemoryConsumer::new("AsOfJoinInput").register(context.memory_pool());
-            Ok(collect_right_input(
-                right_stream,
-                reservation,
-                build_metrics,
-            ))
-        })?;
+        let streamed = self.left.output_partitioning().partition_count() == 1;
         let (left_keys, right_keys) = self.on.iter().cloned().unzip();
         let output_schema = self.schema();
         let stream_schema = Arc::clone(&output_schema);
@@ -504,6 +504,34 @@ impl ExecutionPlan for AsOfJoinExec {
             None => self.column_indices.clone(),
         };
         let batch_size = context.session_config().batch_size();
+        if streamed {
+            let right_stream = self.right.execute(0, Arc::clone(&context))?;
+            let reservation =
+                MemoryConsumer::new("AsOfJoinInput").register(context.memory_pool());
+            let right_memory =
+                Box::new(RetainedRightMemory::new(reservation, metrics.clone()));
+            return Ok(Box::pin(AsOfJoinStream::new(
+                output_schema,
+                InputCursor::new(left_stream, left_keys, left_match),
+                InputCursor::new(right_stream, right_keys, right_match),
+                match_op,
+                column_indices,
+                batch_size,
+                metrics,
+                RightInput::Streamed(right_memory),
+            )));
+        }
+        let build_metrics = metrics.clone();
+        let right_fut = self.right_fut.try_once(|| {
+            let right_stream = self.right.execute(0, Arc::clone(&context))?;
+            let reservation =
+                MemoryConsumer::new("AsOfJoinInput").register(context.memory_pool());
+            Ok(collect_right_input(
+                right_stream,
+                reservation,
+                build_metrics,
+            ))
+        })?;
         let stream = stream::once(async move {
             let mut right_fut = right_fut;
             let right_input = poll_fn(|cx| right_fut.get_shared(cx)).await?;
@@ -516,7 +544,9 @@ impl ExecutionPlan for AsOfJoinExec {
                 column_indices,
                 batch_size,
                 metrics,
-                right_input,
+                RightInput::Shared {
+                    _input: right_input,
+                },
             );
             Ok::<SendableRecordBatchStream, datafusion_common::DataFusionError>(Box::pin(
                 stream,
@@ -789,6 +819,93 @@ async fn collect_right_input(
     })
 }
 
+/// How the join obtains and accounts for right input batches.
+enum RightInput {
+    /// Right batches collected once and shared by every left partition. The
+    /// handle keeps them and their reservation alive for this partition's scan.
+    Shared { _input: Arc<BroadcastRightInput> },
+    /// Right batches pulled on demand; only the referenced ones are retained.
+    Streamed(Box<RetainedRightMemory>),
+}
+
+/// Memory accounting for the right batches and arrays a streamed scan still
+/// references.
+///
+/// **Contract**: every retained item must be released before the operator drops
+/// its last reference to it, because the tracker identifies buffers by address
+/// and a freed address can be reused by a later allocation.
+struct RetainedRightMemory {
+    tracker: RecordBatchMemoryTracker,
+    reservation: MemoryReservation,
+    metrics: AsOfJoinMetrics,
+}
+
+impl RetainedRightMemory {
+    fn new(reservation: MemoryReservation, metrics: AsOfJoinMetrics) -> Self {
+        Self {
+            tracker: RecordBatchMemoryTracker::new(),
+            reservation,
+            metrics,
+        }
+    }
+
+    fn retain_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let delta = self.tracker.count_batch(batch);
+        if let Err(error) = self.reservation.try_grow(delta) {
+            self.tracker.uncount_batch(batch);
+            return Err(error);
+        }
+        self.metrics.build_mem_used.set_max(self.reservation.size());
+        Ok(())
+    }
+
+    fn retain_array(&mut self, array: &dyn Array) -> Result<()> {
+        let delta = self.tracker.count_array(array);
+        if let Err(error) = self.reservation.try_grow(delta) {
+            self.tracker.uncount_array(array);
+            return Err(error);
+        }
+        self.metrics.build_mem_used.set_max(self.reservation.size());
+        Ok(())
+    }
+
+    fn release_batch(&mut self, batch: &RecordBatch) {
+        let freed = self.tracker.uncount_batch(batch);
+        self.reservation.shrink(freed);
+    }
+
+    fn release_array(&mut self, array: &dyn Array) {
+        let freed = self.tracker.uncount_array(array);
+        self.reservation.shrink(freed);
+    }
+}
+
+/// Retains a cursor batch with its evaluated key and match arrays, rolling back
+/// exactly the successful retains if one fails. A failed retain releases itself,
+/// and the tracker counts references rather than owners, so rolling back a retain
+/// that never succeeded would drop another holder's count for the same buffers.
+fn retain_cursor_arrays(
+    memory: &mut RetainedRightMemory,
+    batch: &RecordBatch,
+    key_arrays: &[ArrayRef],
+    match_array: &ArrayRef,
+) -> Result<()> {
+    memory.retain_batch(batch)?;
+    let arrays = key_arrays.iter().chain([match_array]);
+    let mut retained: Vec<&ArrayRef> = Vec::with_capacity(key_arrays.len() + 1);
+    for array in arrays {
+        if let Err(error) = memory.retain_array(array.as_ref()) {
+            for array in retained.into_iter().rev() {
+                memory.release_array(array.as_ref());
+            }
+            memory.release_batch(batch);
+            return Err(error);
+        }
+        retained.push(array);
+    }
+    Ok(())
+}
+
 /// Last eligible right row for the current left equality group.
 ///
 /// The row and its evaluated keys survive right batch changes and output
@@ -810,6 +927,9 @@ struct Candidate {
 ///
 /// Expressions are evaluated once per non-empty batch. `key_batch_id` changes
 /// whenever a new batch is loaded so comparators cannot retain stale arrays.
+///
+/// **Invariant**: in streamed mode the populated fields are always fully
+/// accounted, so any release of them matches an earlier retain.
 struct InputCursor {
     /// Remaining input batches.
     stream: SendableRecordBatchStream,
@@ -857,16 +977,48 @@ impl InputCursor {
         }
     }
 
+    /// Returns whether a row is available, loading the next batch when the
+    /// current one is exhausted. The hot check stays inlined at the call sites;
+    /// loading is the cold path.
+    #[inline]
     fn poll_ensure_row(
         &mut self,
         cx: &mut Context<'_>,
         elapsed_compute: &Time,
+        memory: Option<&mut RetainedRightMemory>,
+    ) -> Poll<Result<bool>> {
+        if let Some(batch) = &self.batch
+            && self.row < batch.num_rows()
+        {
+            return Poll::Ready(Ok(true));
+        }
+        self.poll_load_row(cx, elapsed_compute, memory)
+    }
+
+    /// Loads the next batch when the current one is exhausted, returning
+    /// whether a row is available.
+    fn poll_load_row(
+        &mut self,
+        cx: &mut Context<'_>,
+        elapsed_compute: &Time,
+        mut memory: Option<&mut RetainedRightMemory>,
     ) -> Poll<Result<bool>> {
         loop {
             if let Some(batch) = &self.batch
                 && self.row < batch.num_rows()
             {
                 return Poll::Ready(Ok(true));
+            }
+            if let Some(memory) = memory.as_deref_mut() {
+                if let Some(batch) = &self.batch {
+                    memory.release_batch(batch);
+                }
+                for array in self.key_arrays.iter() {
+                    memory.release_array(array.as_ref());
+                }
+                if let Some(match_array) = &self.match_array {
+                    memory.release_array(match_array.as_ref());
+                }
             }
             self.batch = None;
             self.key_arrays = Arc::from([]);
@@ -886,23 +1038,32 @@ impl InputCursor {
             }
             let batch = Arc::new(batch);
             let _timer = elapsed_compute.timer();
-            let key_arrays = self
+            // Every field stays local until evaluation and accounting succeed,
+            // so an error leaves the cursor in the unloaded state above.
+            let key_arrays: Arc<[ArrayRef]> = self
                 .key_exprs
                 .iter()
                 .map(|expr| expr.evaluate(&batch)?.into_array(batch.num_rows()))
-                .collect::<Result<Vec<_>>>()?;
-            self.key_validity =
+                .collect::<Result<Vec<_>>>()?
+                .into();
+            let key_validity =
                 matchable_join_keys(&key_arrays, NullEquality::NullEqualsNothing);
-            self.key_arrays = key_arrays.into();
             let match_array = self
                 .match_expr
                 .evaluate(&batch)?
                 .into_array(batch.num_rows())?;
-            self.match_validity = match_array.logical_nulls();
+            let match_validity = match_array.logical_nulls();
             // Arrow's comparator distinguishes -0.0 from +0.0, while SQL does
             // not. Normalizing once here is cheaper than fixing every row-level
             // comparison and lets the cached comparator use the arrays directly.
-            self.match_array = Some(normalize_floats(&match_array));
+            let match_array = normalize_floats(&match_array);
+            if let Some(memory) = memory.as_deref_mut() {
+                retain_cursor_arrays(memory, &batch, &key_arrays, &match_array)?;
+            }
+            self.key_arrays = key_arrays;
+            self.key_validity = key_validity;
+            self.match_validity = match_validity;
+            self.match_array = Some(match_array);
             self.key_batch_id += 1;
             self.batch = Some(batch);
         }
@@ -930,13 +1091,22 @@ impl InputCursor {
     fn advance(&mut self) {
         self.row += 1;
     }
+
+    /// Whether the next [`Self::poll_ensure_row`] will unload the current batch.
+    fn at_batch_end(&self) -> bool {
+        self.batch
+            .as_ref()
+            .is_none_or(|batch| self.row >= batch.num_rows())
+    }
 }
 
 #[derive(Clone)]
 struct AsOfJoinMetrics {
     /// Standard output-row and elapsed-compute metrics.
     baseline: BaselineMetrics,
-    /// Peak bytes retained for the shared right input.
+    /// Peak bytes of right input retained by this partition's join: the whole
+    /// collected input in shared mode, the live cursor, candidate, and pending
+    /// output batches in streamed mode.
     ///
     /// `peak_memory_usage` records this as `MetricValue::PeakMemoryUsage`; `Gauge`
     /// is the handle used to update that metric.
@@ -978,14 +1148,18 @@ impl PendingRows {
         self.indices.is_empty()
     }
 
-    fn push(&mut self, batch: Arc<RecordBatch>, row: usize) {
+    /// Returns whether `batch` was not already a source of a pending row.
+    fn push(&mut self, batch: Arc<RecordBatch>, row: usize) -> bool {
         let ptr = Arc::as_ptr(&batch) as usize;
+        let mut inserted = false;
         let source = *self.source_by_ptr.entry(ptr).or_insert_with(|| {
             let source = self.sources.len();
             self.sources.push(batch);
+            inserted = true;
             source
         });
         self.indices.push(Some((source, row)));
+        inserted
     }
 
     fn push_null(&mut self) {
@@ -1037,12 +1211,26 @@ impl PendingRows {
         interleave(&source_arrays, interleave_indices).map_err(Into::into)
     }
 
+    /// Drops the most recently inserted source without touching `indices`.
+    /// Only valid when the caller abandons the pending rows afterwards.
+    fn forget_last_source(&mut self) {
+        if let Some(batch) = self.sources.pop() {
+            self.source_by_ptr.remove(&(Arc::as_ptr(&batch) as usize));
+        }
+    }
+
     fn clear(&mut self) {
         self.sources.clear();
         self.source_by_ptr.clear();
         self.indices.clear();
     }
 }
+
+/// Caps the right batches pending output may pin in streamed mode. It bounds
+/// retained right batches independently of the right/left density ratio: a
+/// sparse left over a dense right would otherwise reference up to `batch_size`
+/// distinct right batches between flushes. It is not a byte bound.
+const MAX_PENDING_RIGHT_BATCHES: usize = 16;
 
 /// Per-left-partition state for the monotonic ASOF scan.
 ///
@@ -1060,10 +1248,11 @@ struct AsOfJoinStream {
     schema: SchemaRef,
     /// Cursor over the current left partition.
     left: InputCursor,
-    /// Independent cursor over the shared, ordered right input.
+    /// Independent cursor over the ordered right input.
     right: InputCursor,
-    /// Retains the shared right batches and their memory reservation.
-    _right_input: Arc<BroadcastRightInput>,
+    /// Holds the shared right batches, or the memory accounting for the
+    /// streamed ones.
+    right_input: RightInput,
     /// Validated ordered match operator.
     op: Operator,
     /// Projected output columns and their input sides.
@@ -1101,7 +1290,7 @@ impl AsOfJoinStream {
         column_indices: Vec<ColumnIndex>,
         batch_size: usize,
         metrics: AsOfJoinMetrics,
-        right_input: Arc<BroadcastRightInput>,
+        right_input: RightInput,
     ) -> Self {
         let group_sort_options = vec![
             SortOptions {
@@ -1116,7 +1305,7 @@ impl AsOfJoinStream {
             schema,
             left,
             right,
-            _right_input: right_input,
+            right_input,
             op,
             projects_right: column_indices
                 .iter()
@@ -1130,6 +1319,93 @@ impl AsOfJoinStream {
             batch_size: batch_size.max(1),
             metrics,
         }
+    }
+
+    fn right_memory(&mut self) -> Option<&mut RetainedRightMemory> {
+        match &mut self.right_input {
+            RightInput::Shared { .. } => None,
+            RightInput::Streamed(memory) => Some(memory),
+        }
+    }
+
+    /// Releases the previous candidate and retains the new one when they come
+    /// from different right batches. The comparator cache is dropped first so
+    /// it cannot outlive the arrays being uncounted.
+    fn set_candidate(&mut self, candidate: Option<Candidate>) -> Result<()> {
+        let previous_batch_id = self.candidate.as_ref().map(|c| c.key_batch_id);
+        let next_batch_id = candidate.as_ref().map(|c| c.key_batch_id);
+        if previous_batch_id == next_batch_id {
+            self.candidate = candidate;
+            return Ok(());
+        }
+        self.candidate_group_comparator = None;
+        let previous = self.candidate.take();
+        if let Some(memory) = self.right_memory() {
+            if let Some(previous) = &previous {
+                for array in previous.key_arrays.iter() {
+                    memory.release_array(array.as_ref());
+                }
+                memory.release_batch(&previous.batch);
+            }
+            if let Some(candidate) = &candidate {
+                // The cursor still holds this batch and these arrays, so these
+                // retains only add a reference and never new bytes.
+                memory.retain_batch(&candidate.batch)?;
+                for (retained, array) in candidate.key_arrays.iter().enumerate() {
+                    if let Err(error) = memory.retain_array(array.as_ref()) {
+                        for array in candidate.key_arrays[..retained].iter().rev() {
+                            memory.release_array(array.as_ref());
+                        }
+                        memory.release_batch(&candidate.batch);
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        drop(previous);
+        self.candidate = candidate;
+        Ok(())
+    }
+
+    /// Releases every right item this partition still accounts for. Called at
+    /// left EOF so an exhausted but still-alive stream owns no reservation.
+    fn release_right_memory(&mut self) {
+        if matches!(self.right_input, RightInput::Shared { .. }) {
+            return;
+        }
+        self.input_group_comparator = None;
+        self.input_match_comparator = None;
+        self.candidate_group_comparator = None;
+        let candidate = self.candidate.take();
+        let pending_right = std::mem::take(&mut self.pending_right);
+        let right_batch = self.right.batch.take();
+        let right_key_arrays =
+            std::mem::replace(&mut self.right.key_arrays, Arc::from([]));
+        let right_match_array = self.right.match_array.take();
+        self.right.key_validity = None;
+        self.right.match_validity = None;
+        let RightInput::Streamed(memory) = &mut self.right_input else {
+            return;
+        };
+        if let Some(candidate) = &candidate {
+            for array in candidate.key_arrays.iter() {
+                memory.release_array(array.as_ref());
+            }
+            memory.release_batch(&candidate.batch);
+        }
+        for batch in &pending_right.sources {
+            memory.release_batch(batch);
+        }
+        for array in right_key_arrays.iter() {
+            memory.release_array(array.as_ref());
+        }
+        if let Some(array) = &right_match_array {
+            memory.release_array(array.as_ref());
+        }
+        if let Some(batch) = &right_batch {
+            memory.release_batch(batch);
+        }
+        memory.reservation.free();
     }
 
     fn compare_input_groups(&mut self) -> Result<Ordering> {
@@ -1264,37 +1540,54 @@ impl AsOfJoinStream {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<RecordBatch>>> {
         loop {
-            if self.pending_left.len() >= self.batch_size {
+            // Both caps are checked before a left row is loaded so an early
+            // flush cannot emit a left row whose right scan is unfinished.
+            if self.pending_left.len() >= self.batch_size
+                || (matches!(self.right_input, RightInput::Streamed(_))
+                    && self.pending_right.sources.len() >= MAX_PENDING_RIGHT_BATCHES)
+            {
                 return Poll::Ready(Some(self.flush()));
             }
-            if !ready!(
-                self.left
-                    .poll_ensure_row(cx, self.metrics.baseline.elapsed_compute())
-            )? {
+            if !ready!(self.left.poll_ensure_row(
+                cx,
+                self.metrics.baseline.elapsed_compute(),
+                None
+            ))? {
                 if !self.pending_left.is_empty() {
                     return Poll::Ready(Some(self.flush()));
                 }
+                self.release_right_memory();
                 self.metrics.baseline.done();
                 return Poll::Ready(None);
             }
 
             if self.left.match_is_null() || self.left.group_has_null() {
-                self.candidate = None;
-                self.candidate_group_comparator = None;
+                self.set_candidate(None)?;
                 self.push_current_left(None)?;
                 self.left.advance();
                 continue;
             }
             if self.candidate_is_other_group()? {
-                self.candidate = None;
-                self.candidate_group_comparator = None;
+                self.set_candidate(None)?;
             }
 
             loop {
-                if !ready!(
-                    self.right
-                        .poll_ensure_row(cx, self.metrics.baseline.elapsed_compute())
-                )? {
+                if self.right.at_batch_end() {
+                    // The caches hold the current right arrays, which the cursor
+                    // is about to release; dropping them first keeps the closures
+                    // from outliving the uncount.
+                    self.input_group_comparator = None;
+                    self.input_match_comparator = None;
+                }
+                let memory = match &mut self.right_input {
+                    RightInput::Shared { .. } => None,
+                    RightInput::Streamed(memory) => Some(&mut **memory),
+                };
+                if !ready!(self.right.poll_ensure_row(
+                    cx,
+                    self.metrics.baseline.elapsed_compute(),
+                    memory
+                ))? {
                     break;
                 }
                 if self.right.group_has_null() {
@@ -1320,12 +1613,12 @@ impl AsOfJoinStream {
                 // Replacing the candidate selects the nearest eligible row.
                 // Equal match values have no secondary ordering, so which tied
                 // row wins is intentionally nondeterministic.
-                self.candidate = Some(Candidate {
+                self.set_candidate(Some(Candidate {
                     batch,
                     row,
                     key_arrays: Arc::clone(&self.right.key_arrays),
                     key_batch_id: self.right.key_batch_id,
-                });
+                }))?;
                 self.right.advance();
             }
 
@@ -1341,7 +1634,20 @@ impl AsOfJoinStream {
         match candidate {
             Some(candidate) => {
                 if self.projects_right {
-                    self.pending_right.push(candidate.batch, candidate.row);
+                    let batch = Arc::clone(&candidate.batch);
+                    // `pending_right` keeps this batch past the cursor and the
+                    // candidate, so each distinct source is accounted once.
+                    let inserted =
+                        self.pending_right.push(candidate.batch, candidate.row);
+                    if inserted
+                        && let RightInput::Streamed(memory) = &mut self.right_input
+                        && let Err(error) = memory.retain_batch(&batch)
+                    {
+                        // The failed retain already released itself, so this
+                        // source must not be released again when flushing.
+                        self.pending_right.forget_last_source();
+                        return Err(error);
+                    }
                 }
             }
             None => {
@@ -1375,6 +1681,11 @@ impl AsOfJoinStream {
             )?);
         }
         self.pending_left.clear();
+        if let RightInput::Streamed(memory) = &mut self.right_input {
+            for batch in &self.pending_right.sources {
+                memory.release_batch(batch);
+            }
+        }
         self.pending_right.clear();
         let options = RecordBatchOptions::new().with_row_count(Some(row_count));
         let batch = RecordBatch::try_new_with_options(
@@ -1400,7 +1711,13 @@ impl Stream for AsOfJoinStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        self.poll_next_impl(cx)
+        let result = self.poll_next_impl(cx);
+        if matches!(result, Poll::Ready(Some(Err(_)))) {
+            // A failed stream is never polled again, so release here rather
+            // than waiting for the caller to drop it.
+            self.release_right_memory();
+        }
+        result
     }
 }
 
@@ -1504,6 +1821,7 @@ mod tests {
     use super::*;
     use crate::collect;
     use crate::test::TestMemoryExec;
+    use crate::{Partitioning, PlanProperties};
     use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field};
     use datafusion_common::ScalarValue;
@@ -1511,10 +1829,12 @@ mod tests {
     use datafusion_execution::config::SessionConfig;
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_expr::ColumnarValue;
+    use datafusion_physical_expr::EquivalenceProperties;
     use datafusion_physical_expr::expressions::{BinaryExpr, CastExpr};
     use datafusion_physical_expr::projection::ProjectionExpr;
     use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
     use insta::assert_snapshot;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
     struct VolatileExpr;
@@ -1573,6 +1893,224 @@ mod tests {
             ],
         )
         .map_err(Into::into)
+    }
+
+    /// Single-partition plan whose stream yields prepared results lazily and
+    /// counts the batches it has handed out.
+    #[derive(Debug)]
+    struct CountingExec {
+        data: Vec<Result<RecordBatch>>,
+        schema: SchemaRef,
+        /// Inserts one `Poll::Pending` before every batch when set.
+        pending_between_batches: bool,
+        yielded: Arc<AtomicUsize>,
+        cache: Arc<PlanProperties>,
+    }
+
+    impl CountingExec {
+        fn new(batches: Vec<RecordBatch>, schema: SchemaRef) -> Self {
+            Self::with_results(batches.into_iter().map(Ok).collect(), schema)
+        }
+
+        fn with_results(data: Vec<Result<RecordBatch>>, schema: SchemaRef) -> Self {
+            let cache = Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(Arc::clone(&schema)),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            ));
+            Self {
+                data,
+                schema,
+                pending_between_batches: false,
+                yielded: Arc::new(AtomicUsize::new(0)),
+                cache,
+            }
+        }
+
+        fn with_pending_between_batches(mut self) -> Self {
+            self.pending_between_batches = true;
+            self
+        }
+
+        fn yielded(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.yielded)
+        }
+    }
+
+    impl DisplayAs for CountingExec {
+        fn fmt_as(
+            &self,
+            _t: DisplayFormatType,
+            f: &mut Formatter<'_>,
+        ) -> std::fmt::Result {
+            write!(f, "CountingExec")
+        }
+    }
+
+    impl ExecutionPlan for CountingExec {
+        fn name(&self) -> &'static str {
+            "CountingExec"
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.cache
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
+        fn replace_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+            _options: ReplaceChildrenOptions,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            internal_err!("CountingExec has no children")
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            self.replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            assert_eq!(partition, 0);
+            let data = self
+                .data
+                .iter()
+                .map(|result| match result {
+                    Ok(batch) => Ok(batch.clone()),
+                    Err(error) => Err(datafusion_common::DataFusionError::External(
+                        Box::new(std::io::Error::other(error.to_string())),
+                    )),
+                })
+                .collect::<Vec<_>>();
+            let yielded = Arc::clone(&self.yielded);
+            let mut remaining = data.into_iter();
+            let mut pending = self.pending_between_batches;
+            let pending_between_batches = self.pending_between_batches;
+            let stream = stream::poll_fn(move |cx: &mut Context<'_>| {
+                if pending && remaining.len() > 0 {
+                    pending = false;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                pending = pending_between_batches;
+                match remaining.next() {
+                    Some(result) => {
+                        yielded.fetch_add(1, AtomicOrdering::SeqCst);
+                        Poll::Ready(Some(result))
+                    }
+                    None => Poll::Ready(None),
+                }
+            });
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&self.schema),
+                stream,
+            )))
+        }
+    }
+
+    fn ts_price_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, true),
+            Field::new("price", DataType::Int32, false),
+        ]))
+    }
+
+    fn ts_id_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, true),
+            Field::new("id", DataType::Int32, false),
+        ]))
+    }
+
+    fn ts_batch(
+        schema: &SchemaRef,
+        times: Vec<Option<i64>>,
+        values: Vec<i32>,
+    ) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(Int64Array::from(times)),
+                Arc::new(Int32Array::from(values)),
+            ],
+        )
+        .expect("ASOF test batch must be valid")
+    }
+
+    /// Builds a streamed-mode join: one left partition over `left` and a lazy
+    /// right child, with no equality keys and `ts`/`price` projected.
+    fn streamed_exec(
+        left_batches: Vec<RecordBatch>,
+        right: Arc<CountingExec>,
+        op: Operator,
+    ) -> Result<Arc<AsOfJoinExec>> {
+        let left_schema = left_batches
+            .first()
+            .map(RecordBatch::schema)
+            .unwrap_or_else(ts_id_schema);
+        let left = TestMemoryExec::try_new_exec(
+            &[left_batches],
+            Arc::clone(&left_schema),
+            None,
+        )?;
+        Ok(Arc::new(AsOfJoinExec::try_new(
+            left,
+            right,
+            vec![],
+            AsOfMatchExpr::new(
+                Arc::new(PhysicalColumn::new("ts", 0)),
+                op,
+                Arc::new(PhysicalColumn::new("ts", 0)),
+            ),
+            Some(vec![0, 3]),
+        )?))
+    }
+
+    /// Reads the `(left ts, right price)` pairs of an ASOF output batch.
+    fn output_pairs(batches: &[RecordBatch]) -> Vec<(Option<i64>, Option<i32>)> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let left = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("left ts column");
+                let right = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("right price column");
+                (0..batch.num_rows())
+                    .map(|row| {
+                        (
+                            (!left.is_null(row)).then(|| left.value(row)),
+                            (!right.is_null(row)).then(|| right.value(row)),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     fn test_exec() -> Result<Arc<AsOfJoinExec>> {
@@ -1856,6 +2394,34 @@ mod tests {
         +----+-------+
         ");
 
+        let strict_predecessor =
+            exec_without_equality_keys(vec![1, 4, 7], vec![2, 4, 6], Operator::Gt)?;
+        let strict_predecessor =
+            collect(strict_predecessor, Arc::new(TaskContext::default())).await?;
+        assert_snapshot!(batches_to_sort_string(&strict_predecessor), @r"
+        +----+-------+
+        | id | price |
+        +----+-------+
+        | 1  |       |
+        | 4  | 20    |
+        | 7  | 60    |
+        +----+-------+
+        ");
+
+        let inclusive_successor =
+            exec_without_equality_keys(vec![7, 4, 1], vec![6, 4, 2], Operator::LtEq)?;
+        let inclusive_successor =
+            collect(inclusive_successor, Arc::new(TaskContext::default())).await?;
+        assert_snapshot!(batches_to_sort_string(&inclusive_successor), @r"
+        +----+-------+
+        | id | price |
+        +----+-------+
+        | 1  | 20    |
+        | 4  | 40    |
+        | 7  |       |
+        +----+-------+
+        ");
+
         let successor =
             exec_without_equality_keys(vec![7, 4, 1], vec![6, 4, 2], Operator::Lt)?;
         let successor = collect(successor, Arc::new(TaskContext::default())).await?;
@@ -1987,22 +2553,32 @@ mod tests {
         Ok(())
     }
 
-    // Ensure the build-side memory usage equals the sum of all build-side input
-    // batches, verifying that the build-side buffer is shared.
+    // With two left partitions the right input is collected and shared, so the
+    // reservation must equal the sum of its batches counted once, verifying that
+    // sliced build-side buffers are not double counted.
     #[tokio::test]
-    async fn shared_right_buffers_are_reserved_once() -> Result<()> {
+    async fn shared_right_buffers_are_reserved_once_across_left_partitions() -> Result<()>
+    {
         let left_schema = Arc::new(Schema::new(vec![
             Field::new("key", DataType::Utf8, false),
             Field::new("ts", DataType::Int64, false),
             Field::new("id", DataType::Int32, false),
         ]));
         let left = TestMemoryExec::try_new_exec(
-            &[vec![make_batch(
-                &left_schema,
-                vec![Some("A")],
-                vec![Some(4095)],
-                vec![0],
-            )?]],
+            &[
+                vec![make_batch(
+                    &left_schema,
+                    vec![Some("A")],
+                    vec![Some(4095)],
+                    vec![0],
+                )?],
+                vec![make_batch(
+                    &left_schema,
+                    vec![Some("A")],
+                    vec![Some(255)],
+                    vec![1],
+                )?],
+            ],
             Arc::clone(&left_schema),
             None,
         )?;
@@ -2050,7 +2626,7 @@ mod tests {
         let context = Arc::new(TaskContext::default().with_runtime(runtime));
 
         let batches = collect(Arc::clone(&exec) as _, context).await?;
-        let prices = batches
+        let mut prices = batches
             .iter()
             .flat_map(|batch| {
                 batch
@@ -2061,7 +2637,8 @@ mod tests {
                     .iter()
             })
             .collect::<Vec<_>>();
-        assert_eq!(prices, vec![Some(4095)]);
+        prices.sort();
+        assert_eq!(prices, vec![Some(255), Some(4095)]);
 
         let metrics = exec.metrics().expect("ASOF metrics must be present");
         assert_eq!(
@@ -2168,6 +2745,560 @@ mod tests {
             exec.child_stats_requests(None),
             vec![ChildStats::At(None), ChildStats::Skip]
         );
+        Ok(())
+    }
+    // Streamed mode emits a left row as soon as its match is final, without
+    // draining the right input. Left ts 5 matches right ts 1 once right ts 100
+    // proves no closer predecessor exists, so only the first right batch is
+    // consumed; left ts 50 is answered from the same cached candidate.
+    #[tokio::test]
+    async fn single_left_partition_emits_before_right_eof() -> Result<()> {
+        let left_schema = ts_id_schema();
+        let right_schema = ts_price_schema();
+        let right = Arc::new(CountingExec::new(
+            vec![
+                ts_batch(&right_schema, vec![Some(1), Some(100)], vec![1, 100]),
+                ts_batch(&right_schema, vec![Some(200), Some(300)], vec![200, 300]),
+                ts_batch(&right_schema, vec![Some(400), Some(600)], vec![400, 600]),
+                ts_batch(&right_schema, vec![Some(700)], vec![700]),
+            ],
+            Arc::clone(&right_schema),
+        ));
+        let yielded = right.yielded();
+        let exec = streamed_exec(
+            vec![ts_batch(
+                &left_schema,
+                vec![Some(5), Some(50), Some(500)],
+                vec![5, 50, 500],
+            )],
+            right,
+            Operator::GtEq,
+        )?;
+
+        let context = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_batch_size(1)),
+        );
+        let mut stream = exec.execute(0, context)?;
+
+        let first = stream.next().await.expect("first ASOF output batch")?;
+        assert_eq!(output_pairs(&[first]), vec![(Some(5), Some(1))]);
+        assert_eq!(yielded.load(AtomicOrdering::SeqCst), 1);
+
+        let second = stream.next().await.expect("second ASOF output batch")?;
+        assert_eq!(output_pairs(&[second]), vec![(Some(50), Some(1))]);
+        assert_eq!(yielded.load(AtomicOrdering::SeqCst), 1);
+
+        let mut rest = Vec::new();
+        while let Some(batch) = stream.next().await {
+            rest.push(batch?);
+        }
+        assert_eq!(output_pairs(&rest), vec![(Some(500), Some(400))]);
+        // The scan stops at right ts 600, so the last right batch is never pulled.
+        assert_eq!(yielded.load(AtomicOrdering::SeqCst), 3);
+        Ok(())
+    }
+
+    // Streamed mode must keep only the right batches the scan still references,
+    // so a limit far below the total right size still completes.
+    #[tokio::test]
+    async fn single_left_partition_bounds_retained_right_memory() -> Result<()> {
+        let right_schema = ts_price_schema();
+        let batch_rows = 256;
+        let batch_count = 64;
+        let right_batches = (0..batch_count)
+            .map(|index| {
+                let base = (index * batch_rows) as i64;
+                ts_batch(
+                    &right_schema,
+                    (0..batch_rows).map(|row| Some(base + row as i64)).collect(),
+                    (0..batch_rows)
+                        .map(|row| (base + row as i64) as i32)
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut memory_counter = RecordBatchMemoryCounter::new();
+        let one_batch_size = memory_counter.count_batch(&right_batches[0]);
+        let total_right_size = one_batch_size * batch_count;
+
+        // One left row per right batch, so pending output would otherwise pin
+        // every right batch until the first flush.
+        let left_schema = ts_id_schema();
+        let left_times = (0..batch_count)
+            .map(|index| Some((index * batch_rows) as i64))
+            .collect::<Vec<_>>();
+        let left_batch = ts_batch(
+            &left_schema,
+            left_times.clone(),
+            (0..batch_count).map(|index| index as i32).collect(),
+        );
+        let expected = left_times
+            .iter()
+            .map(|ts| (*ts, ts.map(|ts| ts as i32)))
+            .collect::<Vec<_>>();
+
+        let limit = one_batch_size * 24;
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(limit, 1.0)
+            .build_arc()?;
+        let right = Arc::new(CountingExec::new(
+            right_batches.clone(),
+            Arc::clone(&right_schema),
+        ));
+        let exec = streamed_exec(vec![left_batch.clone()], right, Operator::GtEq)?;
+        let context = Arc::new(TaskContext::default().with_runtime(Arc::clone(&runtime)));
+        let batches = collect(Arc::clone(&exec) as _, Arc::clone(&context)).await?;
+        assert_eq!(output_pairs(&batches), expected);
+
+        let peak = exec
+            .metrics()
+            .and_then(|metrics| metrics.sum_by_name("build_mem_used"))
+            .map(|value| value.as_usize())
+            .expect("ASOF build_mem_used must be recorded");
+        assert!(peak > 0, "streamed mode must account retained right input");
+        assert!(
+            peak < total_right_size,
+            "streamed peak {peak} must stay below the whole right input {total_right_size}"
+        );
+        drop(batches);
+        assert_eq!(context.memory_pool().reserved(), 0);
+
+        // The shared path still reserves the whole right input, so the same
+        // limit exhausts it.
+        let split = batch_count / 2;
+        let left_two_partitions = TestMemoryExec::try_new_exec(
+            &[
+                vec![left_batch.slice(0, split)],
+                vec![left_batch.slice(split, batch_count - split)],
+            ],
+            Arc::clone(&left_schema),
+            None,
+        )?;
+        let shared = Arc::new(AsOfJoinExec::try_new(
+            left_two_partitions,
+            Arc::new(CountingExec::new(right_batches, right_schema)),
+            vec![],
+            AsOfMatchExpr::new(
+                Arc::new(PhysicalColumn::new("ts", 0)),
+                Operator::GtEq,
+                Arc::new(PhysicalColumn::new("ts", 0)),
+            ),
+            Some(vec![0, 3]),
+        )?);
+        let shared_context = Arc::new(TaskContext::default().with_runtime(runtime));
+        let error = collect(shared as _, shared_context)
+            .await
+            .expect_err("the shared path must exhaust the memory limit");
+        assert!(
+            error.to_string().contains("AsOfJoinInput"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    // Slices of one parent batch share buffers, so streamed accounting must
+    // count that parent once even while many slices are referenced.
+    #[tokio::test]
+    async fn streamed_sliced_right_batches_are_counted_once() -> Result<()> {
+        let right_schema = ts_price_schema();
+        let row_count = 4096;
+        let parent = ts_batch(
+            &right_schema,
+            (0..row_count).map(|row| Some(i64::from(row))).collect(),
+            (0..row_count).collect(),
+        );
+        let mut memory_counter = RecordBatchMemoryCounter::new();
+        let retained_size = memory_counter.count_batch(&parent);
+        let right_batches = (0..16)
+            .map(|index| parent.slice(index * 256, 256))
+            .collect::<Vec<_>>();
+
+        let left_schema = ts_id_schema();
+        let exec = streamed_exec(
+            vec![ts_batch(&left_schema, vec![Some(4095)], vec![0])],
+            Arc::new(CountingExec::new(right_batches, Arc::clone(&right_schema))),
+            Operator::GtEq,
+        )?;
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(retained_size, 1.0)
+            .build_arc()?;
+        let context = Arc::new(TaskContext::default().with_runtime(runtime));
+        let batches = collect(Arc::clone(&exec) as _, Arc::clone(&context)).await?;
+        assert_eq!(output_pairs(&batches), vec![(Some(4095), Some(4095))]);
+
+        let peak = exec
+            .metrics()
+            .and_then(|metrics| metrics.sum_by_name("build_mem_used"))
+            .map(|value| value.as_usize())
+            .expect("ASOF build_mem_used must be recorded");
+        assert!(
+            peak <= retained_size,
+            "sliced right batches must not be double counted: {peak} > {retained_size}"
+        );
+        drop(batches);
+        assert_eq!(context.memory_pool().reserved(), 0);
+        Ok(())
+    }
+
+    // Both right-input modes run the same state machine, so splitting the left
+    // input across partitions must not change the result.
+    #[tokio::test]
+    async fn shared_and_streamed_paths_agree() -> Result<()> {
+        let streamed = test_exec()?;
+        let left = Arc::clone(&streamed.left);
+        let left_batches = left
+            .execute(0, Arc::new(TaskContext::default()))?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let split = left_batches.len() / 2;
+        let shared_left = TestMemoryExec::try_new_exec(
+            &[
+                left_batches[..split].to_vec(),
+                left_batches[split..].to_vec(),
+            ],
+            left.schema(),
+            None,
+        )?;
+        let shared = Arc::new(AsOfJoinExec::try_new(
+            shared_left,
+            Arc::clone(&streamed.right),
+            streamed.on.clone(),
+            streamed.match_condition.clone(),
+            Some(vec![0, 1, 2, 5]),
+        )?);
+
+        let streamed_batches =
+            collect(streamed as _, Arc::new(TaskContext::default())).await?;
+        let shared_batches =
+            collect(shared as _, Arc::new(TaskContext::default())).await?;
+        assert_eq!(
+            batches_to_sort_string(&streamed_batches).to_string(),
+            batches_to_sort_string(&shared_batches).to_string()
+        );
+        Ok(())
+    }
+
+    // A dropped streamed stream must release the right batches it still holds.
+    #[tokio::test]
+    async fn streamed_right_releases_on_drop() -> Result<()> {
+        let right_schema = ts_price_schema();
+        let left_schema = ts_id_schema();
+        let exec = streamed_exec(
+            vec![ts_batch(&left_schema, vec![Some(10), Some(20)], vec![1, 2])],
+            Arc::new(CountingExec::new(
+                vec![
+                    ts_batch(&right_schema, vec![Some(1)], vec![1]),
+                    ts_batch(&right_schema, vec![Some(15)], vec![15]),
+                ],
+                Arc::clone(&right_schema),
+            )),
+            Operator::GtEq,
+        )?;
+        let context = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_batch_size(1)),
+        );
+        let mut stream = exec.execute(0, Arc::clone(&context))?;
+        let first = stream.next().await.expect("first ASOF output batch")?;
+        assert_eq!(output_pairs(&[first]), vec![(Some(10), Some(1))]);
+        drop(stream);
+        assert_eq!(context.memory_pool().reserved(), 0);
+        Ok(())
+    }
+
+    // An exhausted but still-alive streamed stream must own no reservation.
+    #[tokio::test]
+    async fn streamed_right_releases_after_exhaustion() -> Result<()> {
+        let right_schema = ts_price_schema();
+        let left_schema = ts_id_schema();
+        let exec = streamed_exec(
+            vec![ts_batch(&left_schema, vec![Some(10), Some(20)], vec![1, 2])],
+            Arc::new(CountingExec::new(
+                vec![
+                    ts_batch(&right_schema, vec![Some(1)], vec![1]),
+                    ts_batch(&right_schema, vec![Some(15)], vec![15]),
+                ],
+                Arc::clone(&right_schema),
+            )),
+            Operator::GtEq,
+        )?;
+        let context = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_batch_size(1)),
+        );
+        let mut stream = exec.execute(0, Arc::clone(&context))?;
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            batches.push(batch?);
+        }
+        assert_eq!(
+            output_pairs(&batches),
+            vec![(Some(10), Some(1)), (Some(20), Some(15))]
+        );
+        drop(batches);
+        assert_eq!(context.memory_pool().reserved(), 0);
+        drop(stream);
+        Ok(())
+    }
+
+    // A right-input error must release the retained right state immediately,
+    // without waiting for the failed stream to be dropped. The first right
+    // batch is retained when the error arrives, so there is state to release.
+    #[tokio::test]
+    async fn streamed_right_releases_on_error() -> Result<()> {
+        let right_schema = ts_price_schema();
+        let left_schema = ts_id_schema();
+        let exec = streamed_exec(
+            vec![ts_batch(&left_schema, vec![Some(10), Some(20)], vec![1, 2])],
+            Arc::new(CountingExec::with_results(
+                vec![
+                    Ok(ts_batch(&right_schema, vec![Some(1)], vec![1])),
+                    internal_err!("planted right input failure"),
+                ],
+                Arc::clone(&right_schema),
+            )),
+            Operator::GtEq,
+        )?;
+        let context = Arc::new(TaskContext::default());
+        let mut stream = exec.execute(0, Arc::clone(&context))?;
+        let error = stream
+            .next()
+            .await
+            .expect("the ASOF stream must yield the planted failure")
+            .expect_err("the planted right input failure must surface");
+        assert!(
+            error.to_string().contains("planted right input failure"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(context.memory_pool().reserved(), 0);
+        drop(stream);
+        Ok(())
+    }
+
+    // A sparse left over a dense right would pin one right batch per pending
+    // row, so the cap flushes early while the scan stays correct.
+    #[tokio::test]
+    async fn streamed_pending_right_sources_are_capped() -> Result<()> {
+        let right_schema = ts_price_schema();
+        let batch_count = 40;
+        let right_batches = (0..batch_count)
+            .map(|index| {
+                let ts = index as i64;
+                ts_batch(&right_schema, vec![Some(ts)], vec![ts as i32])
+            })
+            .collect::<Vec<_>>();
+        let left_schema = ts_id_schema();
+        let left_times = (0..batch_count)
+            .map(|index| Some(index as i64))
+            .collect::<Vec<_>>();
+        let exec = streamed_exec(
+            vec![ts_batch(
+                &left_schema,
+                left_times.clone(),
+                (0..batch_count).collect(),
+            )],
+            Arc::new(CountingExec::new(right_batches, Arc::clone(&right_schema))),
+            Operator::GtEq,
+        )?;
+        let context = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_batch_size(1024)),
+        );
+        let batches = collect(Arc::clone(&exec) as _, context).await?;
+        // 40 distinct right sources at a cap of 16 give 3 output batches.
+        assert_eq!(
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            vec![16, 16, 8]
+        );
+        assert_eq!(
+            output_pairs(&batches),
+            left_times
+                .iter()
+                .map(|ts| (*ts, ts.map(|ts| ts as i32)))
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    // A `Poll::Pending` between right batches must not change which row wins at
+    // a batch boundary. Right ts are `[1, 3]`, Pending, `[5, 5, 6]`; for left
+    // ts 5, `>` keeps candidate 3 from the first batch across the Pending,
+    // while `>=` advances into the second batch and takes one of the ts 5 rows.
+    #[tokio::test]
+    async fn streamed_pending_preserves_batch_boundary_matches() -> Result<()> {
+        let right_schema = ts_price_schema();
+        let left_schema = ts_id_schema();
+        for op in [Operator::Gt, Operator::GtEq] {
+            let right = Arc::new(
+                CountingExec::new(
+                    vec![
+                        ts_batch(&right_schema, vec![Some(1), Some(3)], vec![1, 3]),
+                        ts_batch(
+                            &right_schema,
+                            vec![Some(5), Some(5), Some(6)],
+                            vec![5, 55, 6],
+                        ),
+                    ],
+                    Arc::clone(&right_schema),
+                )
+                .with_pending_between_batches(),
+            );
+            let exec = streamed_exec(
+                vec![ts_batch(&left_schema, vec![Some(5)], vec![0])],
+                right,
+                op,
+            )?;
+            let batches = collect(exec as _, Arc::new(TaskContext::default())).await?;
+            let pairs = output_pairs(&batches);
+            assert_eq!(pairs.len(), 1);
+            assert_eq!(pairs[0].0, Some(5));
+            match op {
+                Operator::Gt => assert_eq!(pairs[0].1, Some(3)),
+                // The two eligible rows with ts 5 tie, so either payload is legal.
+                _ => assert!(
+                    pairs[0].1 == Some(5) || pairs[0].1 == Some(55),
+                    "tied candidate must be one of the equal right rows: {:?}",
+                    pairs[0].1
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    // An equality-group change across a `Poll::Pending` boundary must clear the
+    // candidate: left (A,3) matches right (A,2); left (B,0) has no predecessor;
+    // left (B,2) matches right (B,1).
+    #[tokio::test]
+    async fn streamed_pending_preserves_group_change() -> Result<()> {
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, true),
+            Field::new("ts", DataType::Int64, true),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, true),
+            Field::new("ts", DataType::Int64, true),
+            Field::new("price", DataType::Int32, false),
+        ]));
+        let right = Arc::new(
+            CountingExec::new(
+                vec![
+                    make_batch(
+                        &right_schema,
+                        vec![Some("A"), Some("A")],
+                        vec![Some(1), Some(2)],
+                        vec![1, 2],
+                    )?,
+                    make_batch(&right_schema, vec![Some("B")], vec![Some(1)], vec![11])?,
+                ],
+                Arc::clone(&right_schema),
+            )
+            .with_pending_between_batches(),
+        );
+        let left = TestMemoryExec::try_new_exec(
+            &[vec![make_batch(
+                &left_schema,
+                vec![Some("A"), Some("B"), Some("B")],
+                vec![Some(3), Some(0), Some(2)],
+                vec![0, 1, 2],
+            )?]],
+            Arc::clone(&left_schema),
+            None,
+        )?;
+        let exec = Arc::new(AsOfJoinExec::try_new(
+            left,
+            right,
+            vec![(
+                Arc::new(PhysicalColumn::new("key", 0)),
+                Arc::new(PhysicalColumn::new("key", 0)),
+            )],
+            AsOfMatchExpr::new(
+                Arc::new(PhysicalColumn::new("ts", 1)),
+                Operator::GtEq,
+                Arc::new(PhysicalColumn::new("ts", 1)),
+            ),
+            Some(vec![0, 1, 2, 5]),
+        )?);
+        let batches = collect(exec as _, Arc::new(TaskContext::default())).await?;
+        assert_snapshot!(batches_to_sort_string(&batches), @r"
+        +-----+----+----+-------+
+        | key | ts | id | price |
+        +-----+----+----+-------+
+        | A   | 3  | 0  | 2     |
+        | B   | 0  | 1  |       |
+        | B   | 2  | 2  | 11    |
+        +-----+----+----+-------+
+        ");
+        Ok(())
+    }
+
+    // NULL equality keys and NULL match values on either side never match, and
+    // streamed mode must release the batches they reference all the same.
+    #[tokio::test]
+    async fn streamed_null_keys_never_match() -> Result<()> {
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, true),
+            Field::new("ts", DataType::Int64, true),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, true),
+            Field::new("ts", DataType::Int64, true),
+            Field::new("price", DataType::Int32, false),
+        ]));
+        let right = Arc::new(CountingExec::new(
+            vec![
+                make_batch(
+                    &right_schema,
+                    vec![None, Some("A")],
+                    vec![Some(1), None],
+                    vec![900, 901],
+                )?,
+                make_batch(&right_schema, vec![Some("A")], vec![Some(2)], vec![20])?,
+            ],
+            Arc::clone(&right_schema),
+        ));
+        let left = TestMemoryExec::try_new_exec(
+            &[vec![make_batch(
+                &left_schema,
+                vec![None, Some("A"), Some("A")],
+                vec![Some(5), None, Some(5)],
+                vec![0, 1, 2],
+            )?]],
+            Arc::clone(&left_schema),
+            None,
+        )?;
+        let exec = Arc::new(AsOfJoinExec::try_new(
+            left,
+            right,
+            vec![(
+                Arc::new(PhysicalColumn::new("key", 0)),
+                Arc::new(PhysicalColumn::new("key", 0)),
+            )],
+            AsOfMatchExpr::new(
+                Arc::new(PhysicalColumn::new("ts", 1)),
+                Operator::GtEq,
+                Arc::new(PhysicalColumn::new("ts", 1)),
+            ),
+            Some(vec![0, 1, 2, 5]),
+        )?);
+        let context = Arc::new(TaskContext::default());
+        let batches = collect(exec as _, Arc::clone(&context)).await?;
+        assert_snapshot!(batches_to_sort_string(&batches), @r"
+        +-----+----+----+-------+
+        | key | ts | id | price |
+        +-----+----+----+-------+
+        |     | 5  | 0  |       |
+        | A   |    | 1  |       |
+        | A   | 5  | 2  | 20    |
+        +-----+----+----+-------+
+        ");
+        drop(batches);
+        assert_eq!(context.memory_pool().reserved(), 0);
         Ok(())
     }
 }
